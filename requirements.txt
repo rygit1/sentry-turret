@@ -1,0 +1,9 @@
+opencv-python>=4.9
+numpy>=1.24
+# optional, only for: python turret_brain.py --detector person
+# ultralytics>=8.3
+#
+# Face recognition (--lock-me / --target-others) needs NO extra pip packages:
+# OpenCV already ships SFace. It only needs the model file in models/ (one-time):
+#   curl -L -o models/face_recognition_sface_2021dec.onnx \
+#     https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx

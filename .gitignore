@@ -1,0 +1,20 @@
+# Python virtual env + caches
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Large model weights (download commands are in the README) and PRIVATE face data
+*.pt
+models/*.onnx
+models/embeddings/
+
+# AI concept mockups and scraped product photos (not the real build)
+mockups/
+guide/
+
+# Screen/phone captures
+*.mov
+*.mp4
