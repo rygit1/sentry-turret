@@ -4,6 +4,11 @@ A camera on a motorized mount finds a person, recognizes their face, aims a gel 
 
 I built the whole thing from scratch: the Python vision and aiming brain, the microcontroller firmware, and the physical rig.
 
+## Demo
+
+<!-- ADD THE VIDEO: open this file on github.com, click the pencil (Edit), then DRAG your video file onto the line below. GitHub uploads it and turns it into a player. Delete this comment and the "video coming" line after. -->
+_Demo video coming._
+
 ![The build](docs/turret.jpg)
 
 ## What it does
