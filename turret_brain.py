@@ -81,11 +81,22 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-class PID:
-    """Per-axis controller. Output is a slew-limited angle delta (degrees/frame)."""
+SPRINT_RAMP = 0.2   # extra deg/frame of sprint speed per degree of error beyond the handoff point
 
-    def __init__(self, kp, ki, kd, slew):
+
+class PID:
+    """Per-axis controller. Output is a slew-limited angle delta (degrees/frame).
+
+    `sprint` (deg/frame, 0 = off): far-target speed cap. Inside the handoff point (the error
+    where kp*err == slew, i.e. the WHOLE close-in zone) the output is bit-identical to the
+    plain controller, so the tuned settle feel is untouched. Beyond it the step ramps up
+    (SPRINT_RAMP per degree of extra error) toward `sprint`, so a cross-room error is crossed
+    at highway speed instead of crawling at the close-in cap the whole way. The ramp starts at
+    exactly `slew`, so speed is continuous at the handoff (no gear-clunk). P-only paths use this."""
+
+    def __init__(self, kp, ki, kd, slew, sprint=0.0):
         self.kp, self.ki, self.kd, self.slew = kp, ki, kd, slew
+        self.sprint = sprint
         self.i = 0.0
         self.prev = 0.0
 
@@ -94,7 +105,14 @@ class PID:
         d = (err - self.prev) / dt if dt > 0 else 0.0
         self.prev = err
         out = self.kp * err + self.ki * self.i + self.kd * d
-        return clamp(out, -self.slew, self.slew)
+        lim = self.slew
+        if self.sprint > self.slew:
+            e = abs(err)
+            start = self.slew / max(self.kp, 1e-6)
+            if e > start:
+                lim = min(self.slew + SPRINT_RAMP * (e - start), self.sprint)
+                out = math.copysign(lim, err)   # far away: travel AT the sprint speed
+        return clamp(out, -lim, lim)
 
     def reset(self):
         self.i = self.prev = 0.0
@@ -251,6 +269,17 @@ def drive(pid, cur, tgt, dt, on_gun, center, deadzone=0.0):
     if abs(err) <= deadzone:
         return cur, err                      # on target enough: hold, don't hunt
     return clamp(cur + pid.step(err, dt), SERVO_MIN, SERVO_MAX), err
+
+
+def coast_step(rem, kp, max_step, deadzone):
+    """One blind coast frame: keep walking toward where the target was LAST SEEN, by the plain
+    (no-sprint) P step. `rem` is the aim travel still owed from the last real detection, so blind
+    motion is bounded by a place the camera actually saw: it can finish the move but never run
+    off to a rail the way velocity extrapolation did. Returns (delta_deg, remaining_after)."""
+    if abs(rem) <= deadzone:
+        return 0.0, rem
+    step = clamp(kp * rem, -max_step, max_step)
+    return step, rem - step
 
 
 def body_aim(box, frac):
@@ -693,8 +722,8 @@ def run(args):
         print(f"[turret] recognition ON -> targeting {tgt}", file=sys.stderr)
 
     pan, tilt = float(PAN_CENTER), float(TILT_CENTER)
-    pid_p = PID(args.kp, 0.0, 0.0, slew=args.max_step)
-    pid_t = PID(args.kp, 0.0, 0.0, slew=args.max_step)
+    pid_p = PID(args.kp, 0.0, 0.0, slew=args.max_step, sprint=args.sprint)  # pan sprints when far
+    pid_t = PID(args.kp, 0.0, 0.0, slew=args.max_step)                      # tilt stays gentle (loose joint)
     armed = False
     lock_count = 0
     last_fire = last_print = 0.0
@@ -702,6 +731,7 @@ def run(args):
     latched = False             # recently locked on the RIGHT target via a face? (gates body-fusion)
     vel_x = vel_y = 0.0          # smoothed target pixel velocity, for predictive lead
     vlast = None                # last center used for the velocity estimate
+    coast_rem = [0.0, 0.0]      # aim travel (pan, tilt deg) still owed if detection blinks mid-move
     patrol_dir = 1              # current pan sweep direction while idle-scanning
     patrol_tilt_dir = 1         # current tilt-band direction for the 2D raster scan
     last_tgt_angle = None       # (pan, tilt) where a target was last seen -> smart search starts there
@@ -818,8 +848,12 @@ def run(args):
                                                    elev_deg=tilt - TILT_CENTER)
                 tgt_pan = clamp(tgt_pan + cor_pan, SERVO_MIN, SERVO_MAX)
                 tgt_tilt = clamp(tgt_tilt + cor_tilt, SERVO_MIN, SERVO_MAX)
+            pan0, tilt0 = pan, tilt
             pan, epan = drive(pid_p, pan, tgt_pan, dt, on_gun, PAN_CENTER, args.deadzone)
             tilt, etilt = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone)
+            # travel still owed after this step: if detection blinks next frame, coast FINISHES
+            # this walk to the last-seen spot instead of freezing mid-stride.
+            coast_rem = [epan - (pan - pan0), etilt - (tilt - tilt0)]
             # normal lock = target centered on the bore. ALSO count it locked when the gun is craned fully UP
             # against its tilt cap and the target sits just above it: a LOW camera can't tilt up enough to
             # center your face, but the bore is then resting on your CHEST = a valid body shot. This is why it
@@ -838,15 +872,20 @@ def run(args):
             lock_count = 0
             gap = now - last_seen
             if gap < args.coast and vlast is not None:
-                # brief dropout (blur/turn): FREEZE on the last aim and wait for re-detect. Do NOT extrapolate
-                # with velocity: on a LOST target the velocity is stale, so `vlast + vel*gap` flung the gun to a
-                # rail (pan 170 / tilt 60) every time detection blinked, which IS the wild "nodding" swing seen
-                # in the test clip. Holding still keeps the bore on you, so a one-frame blur recovers instantly
-                # instead of cascading into a corner-dive and then a patrol snap-back.
-                pass
+                # brief dropout (blur/turn): do NOT extrapolate with velocity. On a LOST target the
+                # velocity is stale, so `vlast + vel*gap` flung the gun to a rail (pan 170 / tilt 60)
+                # every time detection blinked, which IS the wild "nodding" swing seen in the test clip.
+                # But a dead FREEZE mid-swing turned a cross-room move into move-stop-move stutter, so:
+                # FINISH THE WALK. Keep gliding toward the spot the target was last SEEN (coast_rem, a
+                # real bounded distance, no guessing ahead), then hold there and wait for re-detect.
+                dstep, coast_rem[0] = coast_step(coast_rem[0], args.kp, args.max_step, args.deadzone)
+                pan = clamp(pan + dstep, SERVO_MIN, SERVO_MAX)
+                dstep, coast_rem[1] = coast_step(coast_rem[1], args.kp, args.max_step, args.deadzone)
+                tilt = clamp(tilt + dstep, SERVO_MIN, SERVO_MAX)
             else:
                 vel_x = vel_y = 0.0
                 vlast = None
+                coast_rem = [0.0, 0.0]
                 dist_ema = None
                 dist_rate = 0.0
                 pid_p.reset()
@@ -895,7 +934,9 @@ def run(args):
             elif patrolling:
                 extra = f"PATROL {args.patrol_tilt:.0f} (scanning L-R)"
             elif (now - last_seen) < args.coast:
-                extra = "COAST (holding your last spot)"
+                extra = ("COAST (gliding to your last spot)"
+                         if abs(coast_rem[0]) > args.deadzone or abs(coast_rem[1]) > args.deadzone
+                         else "COAST (holding your last spot)")
             else:
                 extra = "HOLD (lost you, about to patrol)"
             if args.auto_calib and dist is not None:
@@ -973,6 +1014,24 @@ def selftest():
         cur = clamp(cur + pid.step(tgt - cur, 1 / 30), 0, 180)
     check("PID converges to target", abs(cur - tgt) < 0.5)
     check("PID slew limited", PID(5, 0, 0, 7.0).step(1000, 1 / 30) == 7.0)
+
+    # sprint-far / tiptoe-near: bit-identical close in, ramps beyond the kp*err==slew handoff
+    sp = PID(0.10, 0, 0, 2.0, sprint=6.0)
+    check("sprint: close-in identical to plain kp (err 10)", abs(sp.step(10, 1 / 30) - 1.0) < 1e-9)
+    check("sprint: continuous at the handoff (err 20)", abs(sp.step(20, 1 / 30) - 2.0) < 1e-9)
+    check("sprint: ramps when far (err 30 -> 4.0)", abs(sp.step(30, 1 / 30) - 4.0) < 1e-9)
+    check("sprint: caps at its ceiling (err 90 -> 6.0)", abs(sp.step(90, 1 / 30) - 6.0) < 1e-9)
+    check("sprint: signed (err -90 -> -6.0)", abs(sp.step(-90, 1 / 30) + 6.0) < 1e-9)
+    check("sprint 0 (default-off) = the old controller exactly", PID(0.10, 0, 0, 2.0).step(90, 1 / 30) == 2.0)
+
+    # coast finishes the walk: blind travel converges to the last-seen spot, never past it, then holds
+    rem, moved = 12.0, 0.0
+    for _ in range(200):
+        dstep, rem = coast_step(rem, 0.10, 2.0, 1.0)
+        moved += dstep
+    check("coast walk converges inside the deadzone", abs(rem) <= 1.0)
+    check("coast walk never overshoots the owed travel", 0 < moved <= 12.0)
+    check("coast holds once inside the deadzone", coast_step(0.5, 0.10, 2.0, 1.0)[0] == 0.0)
 
     check("serial format", serial_cmd(94, 81, False) == "P094 T081")
     check("serial fire flag", serial_cmd(94, 81, True) == "P094 T081 FIRE")
@@ -1110,6 +1169,11 @@ def main():
                     help="max degrees the aim command can move per frame. Lower = smoother, less "
                          "jerky; higher = faster but choppier. (2.0: reverted from 3.5 on 7/18, the faster "
                          "swing hurt smoothness and Ryan wanted the smooth motion back)")
+    ap.add_argument("--sprint", type=float, default=6.0,
+                    help="far-target speed cap, deg/frame (PAN only). When the target is way off to the "
+                         "side the step ramps up to this so it crosses the room fast, then hands back to "
+                         "the untouched kp/max-step glide to settle. Close-in motion is bit-identical to "
+                         "before (the smooth swing is preserved). 0 = off (pre-7/19 behavior)")
     ap.add_argument("--lead", type=float, default=0.12,
                     help="seconds to lead a moving target (0 = aim where it is now)")
     ap.add_argument("--ballistic-lead", action="store_true",

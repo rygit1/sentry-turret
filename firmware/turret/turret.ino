@@ -2,7 +2,8 @@
  * CV Sentry Turret - ESP32 firmware (Phase 1 aim + gel-blaster fire)
  *
  * Receives aim commands from the Mac/Pi brain (turret_brain.py --serial) over USB and
- * drives the pan/tilt servos, slew-limited so motion is smooth. FIRE pulls the gel
+ * drives the pan/tilt servos with a paced sub-degree glide so motion is one smooth
+ * sweep instead of per-command hops. FIRE pulls the gel
  * blaster's OWN trigger with a third servo and holds it for a short burst; the blaster
  * runs its own flywheels off its own battery, so this build has NO flywheel MOSFET and
  * NO dart pusher. A PHYSICAL arm switch gates all firing in hardware as well as software.
@@ -34,9 +35,16 @@ const int ARM_PIN     = 33;
 const int PAN_MIN = 0,  PAN_MAX = 180;    // chip allows FULL range (manual jog is unrestricted)
 const int TILT_MIN = 0, TILT_MAX = 180;   // safe crash-limits (tilt 60-85, pan 38-170) live in the BRAIN's auto loop only
 
-const int PAN_SLEW_STEP  = 2;   // max degrees moved per control tick (smoothness)
-const int TILT_SLEW_STEP = 1;   // tilt moves GENTLER than pan (loose tilt joint, missing a screw)
-const int TICK_MS   = 15;       // ~66 Hz control loop
+// Motion: the brain sends a fresh target about every camera frame (50-80 ms apart). The old code
+// hopped to each target at full servo speed in whole-degree steps, then WAITED for the next
+// command: hop-wait-hop-wait = visible stutter. Now each new target is GLIDED to over ~GLIDE_MS
+// (a hair over one camera frame) in fine sub-degree steps at a fast tick, so the head is still
+// moving when the next command lands = one continuous glide at the commanded average speed.
+const int   TICK_MS     = 5;                       // 200 Hz motion tick (was 15 ms / 66 Hz)
+const int   GLIDE_MS    = 70;                      // spread each brain hop across about one camera frame
+const int   GLIDE_TICKS = GLIDE_MS / TICK_MS;
+const float PAN_TICK_MAX  = 133.0 * TICK_MS / 1000.0;  // speed ceiling per tick (133 deg/s, matches --slew-rate)
+const float TILT_TICK_MAX =  66.0 * TICK_MS / 1000.0;  // tilt stays GENTLER (loose tilt joint, missing a screw)
 
 // Trigger servo: REST = not touching the trigger, PULL = trigger fully squeezed.
 // CALIBRATE both to your linkage in Step 6 (rotate by hand to find the two angles).
@@ -51,6 +59,7 @@ Servo panServo, tiltServo, triggerServo;
 
 float panCur = 90, tiltCur = 72;   // boot to a tilt inside [60,85] so it never slams the cap on reset
 int   panTgt = 90, tiltTgt = 72;
+float panVel = 0, tiltVel = 0;     // glide speed (deg per tick), recomputed on every aim command
 bool  fireReq = false;
 unsigned long lastTick = 0, lastFire = 0, lastRx = 0;
 String line;
@@ -79,6 +88,8 @@ void parseLine(const String &s) {
   if (p >= 0 && t > p) {
     panTgt  = constrain(s.substring(p + 1, p + 4).toInt(), PAN_MIN, PAN_MAX);
     tiltTgt = constrain(s.substring(t + 1, t + 4).toInt(), TILT_MIN, TILT_MAX);
+    panVel  = (panTgt  - panCur)  / (float)GLIDE_TICKS;   // pace the move to land with the next command
+    tiltVel = (tiltTgt - tiltCur) / (float)GLIDE_TICKS;
     lastRx = millis();
   }
   if (s.indexOf("FIRE") >= 0) fireReq = true;
@@ -98,10 +109,18 @@ void fireBurst() {
   triggerServo.write(TRIG_REST);   // release
 }
 
-void slew(float &cur, int tgt, Servo &s, int stepMax) {
-  if (cur < tgt)      cur += min((float)stepMax, (float)tgt - cur);
-  else if (cur > tgt) cur -= min((float)stepMax, cur - (float)tgt);
-  s.write((int)cur);
+void glide(float &cur, int tgt, float &vel, Servo &s, float tickMax) {
+  float rem = (float)tgt - cur;
+  float step = vel;
+  if ((rem > 0 && step <= 0) || (rem < 0 && step >= 0))   // stale/zero pace but not there yet:
+    step = (rem > 0) ? tickMax : -tickMax;                // fall back to the speed ceiling
+  if (step >  tickMax) step =  tickMax;                   // hardware speed ceiling per axis
+  if (step < -tickMax) step = -tickMax;
+  if ((rem >= 0 && step >= rem) || (rem <= 0 && step <= rem)) { cur = tgt; vel = 0; }  // arrive, never pass
+  else cur += step;
+  // sub-degree writes: attach(500,2500) maps 0-180 deg over 2000 us, so 1 us = 0.09 deg.
+  // plain write() rounds to whole degrees, which reads as tiny clicks at glide speeds.
+  s.writeMicroseconds(500 + (int)(cur * (2000.0 / 180.0) + 0.5));
 }
 
 void loop() {
@@ -114,8 +133,8 @@ void loop() {
   unsigned long now = millis();
   if (now - lastTick >= TICK_MS) {
     lastTick = now;
-    slew(panCur, panTgt, panServo, PAN_SLEW_STEP);
-    slew(tiltCur, tiltTgt, tiltServo, TILT_SLEW_STEP);
+    glide(panCur, panTgt, panVel, panServo, PAN_TICK_MAX);
+    glide(tiltCur, tiltTgt, tiltVel, tiltServo, TILT_TICK_MAX);
   }
 
   if (fireReq) {
