@@ -247,7 +247,7 @@ def serial_cmd(pan, tilt, fire):
     return f"P{int(round(pan)):03d} T{int(round(tilt)):03d}" + (" FIRE" if fire else "")
 
 
-def drive(pid, cur, tgt, dt, on_gun, center, deadzone=0.0, lag=0.0):
+def drive(pid, cur, tgt, dt, on_gun, center, deadzone=0.0):
     """Step one servo axis toward `tgt` (an absolute servo angle) and report the error driven.
 
     The right error depends on where the camera is mounted:
@@ -264,36 +264,11 @@ def drive(pid, cur, tgt, dt, on_gun, center, deadzone=0.0, lag=0.0):
     tiny correction. A real servo buzzes/hunts on sub-degree commands it can't physically resolve;
     holding inside the deadzone kills that jitter and the gear wear while staying well inside the
     lock tolerance. 0 = off (the sim default, so convergence checks are unchanged).
-
-    `lag` (deg): the AIM-LAG BRAKE. The frame this error was measured on is ~0.1-0.15s old
-    (camera buffer + detection + the firmware glide), so while the gun swings fast the gun has
-    ALREADY moved `lag` degrees that the measurement can't see yet. Acting on the raw error
-    over-drives and sails PAST the target, then swings back = the pendulum seen 7/19 (150 over
-    a target at 120). Subtracting the already-ordered motion stops the swing ON the target.
-    Zero when the gun is still, so the settled feel is untouched.
-    Returns (new_angle, raw_error_deg): the RAW error is returned so the lock/fire decision
-    stays conservative (locked means the bore measured on you, not merely headed there)."""
+    Returns (new_angle, error_deg)."""
     err = (tgt - center) if on_gun else (tgt - cur)
-    eff = err - lag
-    if abs(eff) <= deadzone:
+    if abs(err) <= deadzone:
         return cur, err                      # on target enough: hold, don't hunt
-    return clamp(cur + pid.step(eff, dt), SERVO_MIN, SERVO_MAX), err
-
-
-def cmd_lookback(hist, t_query):
-    """Newest (pan, tilt) command recorded at or before `t_query` from the small time-ordered
-    history list [(t, pan, tilt), ...]. Falls back to the oldest entry when asked further back
-    than the history reaches; None on an empty history. Feeds the aim-lag brake: 'where was the
-    gun ordered to point when the frame now being acted on was actually captured?'"""
-    ref = None
-    for t, p, tl in hist:
-        if t <= t_query:
-            ref = (p, tl)
-        else:
-            break
-    if ref is None and hist:
-        ref = (hist[0][1], hist[0][2])
-    return ref
+    return clamp(cur + pid.step(err, dt), SERVO_MIN, SERVO_MAX), err
 
 
 def coast_step(rem, kp, max_step, deadzone):
@@ -757,7 +732,6 @@ def run(args):
     vel_x = vel_y = 0.0          # smoothed target pixel velocity, for predictive lead
     vlast = None                # last center used for the velocity estimate
     coast_rem = [0.0, 0.0]      # aim travel (pan, tilt deg) still owed if detection blinks mid-move
-    cmd_hist = []               # (t, pan, tilt) commands recently sent, for the aim-lag brake
     patrol_dir = 1              # current pan sweep direction while idle-scanning
     patrol_tilt_dir = 1         # current tilt-band direction for the 2D raster scan
     last_tgt_angle = None       # (pan, tilt) where a target was last seen -> smart search starts there
@@ -874,21 +848,12 @@ def run(args):
                                                    elev_deg=tilt - TILT_CENTER)
                 tgt_pan = clamp(tgt_pan + cor_pan, SERVO_MIN, SERVO_MAX)
                 tgt_tilt = clamp(tgt_tilt + cor_tilt, SERVO_MIN, SERVO_MAX)
-            # aim-lag brake: how far has the gun ALREADY been ordered to move since the frame
-            # now being acted on was captured? Subtracting it stops the swing ON the target
-            # instead of sailing past and pendulum-ing back (the 7/19 clip: 150 over a target
-            # at 120). Zero when settled, so the close-in feel is untouched.
-            # (on-gun only: with a FIXED camera the view does not move with the servo, so there
-            # is no self-motion staleness to subtract and the screen demo keeps its old feel.)
-            ref = cmd_lookback(cmd_hist, now - args.lag) if on_gun else None
-            lag_pan = (pan - ref[0]) if ref else 0.0
-            lag_tilt = (tilt - ref[1]) if ref else 0.0
             pan0, tilt0 = pan, tilt
-            pan, epan = drive(pid_p, pan, tgt_pan, dt, on_gun, PAN_CENTER, args.deadzone, lag_pan)
-            tilt, etilt = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone, lag_tilt)
-            # travel still owed after this step (lag-corrected): if detection blinks next frame,
-            # coast FINISHES this walk to the last-seen spot instead of freezing mid-stride.
-            coast_rem = [(epan - lag_pan) - (pan - pan0), (etilt - lag_tilt) - (tilt - tilt0)]
+            pan, epan = drive(pid_p, pan, tgt_pan, dt, on_gun, PAN_CENTER, args.deadzone)
+            tilt, etilt = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone)
+            # travel still owed after this step: if detection blinks next frame, coast FINISHES
+            # this walk to the last-seen spot instead of freezing mid-stride.
+            coast_rem = [epan - (pan - pan0), etilt - (tilt - tilt0)]
             # normal lock = target centered on the bore. ALSO count it locked when the gun is craned fully UP
             # against its tilt cap and the target sits just above it: a LOW camera can't tilt up enough to
             # center your face, but the bore is then resting on your CHEST = a valid body shot. This is why it
@@ -951,9 +916,6 @@ def run(args):
 
         pan = clamp(pan, PAN_LIMIT_MIN, PAN_LIMIT_MAX)    # auto-only safe limits (manual jog bypasses this)
         tilt = clamp(tilt, TILT_LIMIT_MIN, TILT_LIMIT_MAX)
-        cmd_hist.append((now, pan, tilt))                 # remember what was ordered when (aim-lag brake)
-        while cmd_hist and cmd_hist[0][0] < now - 1.0:
-            cmd_hist.pop(0)
         cmd = serial_cmd(pan, tilt, fire)
         if link is not None:
             link.write((cmd + "\n").encode())          # every frame for responsive tracking
@@ -1070,32 +1032,6 @@ def selftest():
     check("coast walk converges inside the deadzone", abs(rem) <= 1.0)
     check("coast walk never overshoots the owed travel", 0 < moved <= 12.0)
     check("coast holds once inside the deadzone", coast_step(0.5, 0.10, 2.0, 1.0)[0] == 0.0)
-
-    hist = [(0.0, 100.0, 70.0), (0.1, 104.0, 71.0), (0.2, 108.0, 72.0)]
-    check("cmd_lookback finds the newest entry at/before the time", cmd_lookback(hist, 0.15) == (104.0, 71.0))
-    check("cmd_lookback clamps to the oldest when asked too far back", cmd_lookback(hist, -5.0) == (100.0, 70.0))
-    check("cmd_lookback empty history = None", cmd_lookback([], 1.0) is None)
-
-    # aim-lag brake: a delayed loop (the measurement shows where the gun pointed 5 commands ago:
-    # frame age + detection + firmware glide + a blinked frame, at ~19 fps) sails past the target
-    # without compensation (measured 4.7 deg over); subtracting the already-ordered motion stops ON it.
-    def _lagrun(comp):
-        pidx = PID(0.10, 0, 0, 2.0, sprint=6.0)
-        cmds = [0.0] * 6
-        cur, worst = 0.0, 0.0
-        for _ in range(300):
-            seen = cmds[-6]                        # stale view of our own motion
-            err = 30.0 - seen
-            brake = (cmds[-1] - cmds[-6]) if comp else 0.0
-            cur = clamp(cur + pidx.step(err - brake, 1 / 19), 0, 180)
-            cmds.append(cur)
-            worst = max(worst, cur - 30.0)
-        return cur, worst
-    _, over_raw = _lagrun(False)
-    end_c, over_c = _lagrun(True)
-    check("without the brake a delayed loop overshoots the target", over_raw > 2.0)
-    check("the aim-lag brake kills the overshoot", over_c < 0.5)
-    check("the brake still converges onto the target", abs(end_c - 30.0) < 2.0)
 
     check("serial format", serial_cmd(94, 81, False) == "P094 T081")
     check("serial fire flag", serial_cmd(94, 81, True) == "P094 T081 FIRE")
@@ -1233,11 +1169,6 @@ def main():
                     help="max degrees the aim command can move per frame. Lower = smoother, less "
                          "jerky; higher = faster but choppier. (2.0: reverted from 3.5 on 7/18, the faster "
                          "swing hurt smoothness and Ryan wanted the smooth motion back)")
-    ap.add_argument("--lag", type=float, default=0.15,
-                    help="seconds between what a camera frame shows and when the gun acts on it "
-                         "(frame age + detection + the firmware glide). The aim subtracts the motion "
-                         "already ordered inside that window, so a fast swing stops ON you instead of "
-                         "sailing past and swinging back. 0 = off")
     ap.add_argument("--sprint", type=float, default=6.0,
                     help="far-target speed cap, deg/frame (PAN only). When the target is way off to the "
                          "side the step ramps up to this so it crosses the room fast, then hands back to "
