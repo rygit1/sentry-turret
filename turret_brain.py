@@ -12,6 +12,7 @@ chases the target on screen so you can watch the loop converge and lock.
   Check recognition:  python turret_brain.py --id-eval            # scores you vs everyone, no camera
   Full body (YOLO):   python turret_brain.py --detector person   # pip install ultralytics
   Drive real turret:  python turret_brain.py --serial /dev/cu.usbserial-XXXX
+  One-motion sweep:   python turret_brain.py --serial /dev/cu.usbserial-XXXX --sweep
   Self-test:          python turret_brain.py --selftest
   Keys:               SPACE = arm / disarm,   Q = quit
 
@@ -29,6 +30,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 
 try:
     import numpy as np  # noqa: F401  (cv2 returns numpy arrays)
@@ -280,6 +282,123 @@ def coast_step(rem, kp, max_step, deadzone):
         return 0.0, rem
     step = clamp(kp * rem, -max_step, max_step)
     return step, rem - step
+
+
+FW_PAN_DPS = 133.0          # firmware glide pan speed ceiling (turret.ino PAN_TICK_MAX), deg/s
+SWEEP_ENTER_DEG = 10.0      # target farther off than this = one continuous swing, not stepping
+SWEEP_ARRIVE_DEG = 1.0      # modeled travel remaining below this = the swing is done
+SWEEP_CONFIRM = 2           # consecutive same-side far sightings before launching a swing
+SWEEP_STREAK_S = 0.5        # sightings further apart than this never pair up into a launch
+SWEEP_TIMEOUT_PAD_S = 0.75  # grace past the expected travel time before a forced handoff
+
+
+class SweepController:
+    """One-motion sweep (--sweep): compute the destination ONCE and let the firmware glide run
+    the whole move as a single capped-speed motion, instead of the brain re-steering every frame.
+
+    The cure for the old overshoot is capture-time pairing: each camera measurement is an offset
+    from where the gun pointed WHEN THAT FRAME WAS CAPTURED (~cam_lag seconds ago), so
+    destination = position_then + offset gives the same answer no matter how stale the frame is.
+    A short (time, position) history answers "where was the gun then".
+
+    The gun position is MODELED, not measured (the chip sends no telemetry): while a swing is in
+    flight it advances at the firmware ceiling toward the destination, arrive-never-pass, exactly
+    like glide() in turret.ino; otherwise the caller syncs it to the commanded angle (command and
+    gun agree within ~2 deg at settle/patrol speeds). A swing in flight never re-aims: mid-swing
+    frames are motion-smeared, so v1 is finish, take a fresh look, launch a second swing if needed.
+    A hard deadline (expected travel + pad) guarantees the close-in loop always gets control back."""
+
+    def __init__(self, cam_lag, lo=PAN_LIMIT_MIN, hi=PAN_LIMIT_MAX, speed=FW_PAN_DPS,
+                 enter=SWEEP_ENTER_DEG, arrive=SWEEP_ARRIVE_DEG, confirm=SWEEP_CONFIRM):
+        self.cam_lag = cam_lag
+        self.lo, self.hi = float(lo), float(hi)
+        self.speed = speed
+        self.enter, self.arrive, self.confirm = enter, arrive, confirm
+        self.gun = None                    # modeled gun position, deg
+        self.hist = deque(maxlen=64)       # (time, position) samples, one per loop
+        self.dest = None                   # active swing destination; None = no swing in flight
+        self.deadline = 0.0
+        self.streak = 0                    # consecutive same-side far sightings
+        self.streak_sign = 0
+        self.streak_t = -1e9               # when the latest qualifying sighting happened
+
+    @property
+    def active(self):
+        return self.dest is not None
+
+    def sync(self, t, gun):
+        """No swing in flight: the commanded angle IS the gun estimate. Records history."""
+        self.gun = float(gun)
+        self.hist.append((t, self.gun))
+
+    def pos_at(self, t):
+        """Where the gun pointed at time t (linear interpolation, clamped to the history ends)."""
+        h = self.hist
+        if not h:
+            return self.gun
+        if t >= h[-1][0]:
+            return h[-1][1]
+        if t <= h[0][0]:
+            return h[0][1]
+        for i in range(len(h) - 1, 0, -1):
+            t0, p0 = h[i - 1]
+            t1, p1 = h[i]
+            if t0 <= t <= t1:
+                if t1 <= t0:
+                    return p1
+                return p0 + (p1 - p0) * (t - t0) / (t1 - t0)
+        return h[0][1]
+
+    def target_from(self, t_now, offset_deg):
+        """Absolute destination for a frame seen now: where the gun pointed when the frame was
+        captured, plus the measured offset, capped to the safe rails."""
+        return clamp(self.pos_at(t_now - self.cam_lag) + offset_deg, self.lo, self.hi)
+
+    def measure(self, t_now, offset_deg):
+        """Feed one fresh NO-LEAD pan measurement (deg off frame center). Launches a swing after
+        `confirm` consecutive same-side far sightings; the rail cap is applied BEFORE the far
+        check, so a target past the rail never flickers the mode. No-op while a swing is in
+        flight. Returns True on the frame that launches."""
+        if self.active or self.gun is None:
+            return False
+        dest = self.target_from(t_now, offset_deg)
+        need = dest - self.gun
+        if abs(need) <= self.enter:
+            self.streak = 0
+            return False
+        if t_now - self.streak_t > SWEEP_STREAK_S:
+            self.streak = 0                # a sighting from long ago never pairs with this one
+        sign = 1 if need > 0 else -1
+        self.streak = self.streak + 1 if sign == self.streak_sign else 1
+        self.streak_sign = sign
+        self.streak_t = t_now
+        if self.streak < self.confirm:
+            return False
+        self.streak = 0
+        self.dest = dest
+        self.deadline = t_now + abs(need) / self.speed + SWEEP_TIMEOUT_PAD_S
+        return True
+
+    def step(self, t_now, dt):
+        """Advance the modeled gun toward the destination like the firmware glide: capped speed,
+        arrive-never-pass. Returns the destination on the handoff frame (arrival or the hard
+        timeout), else None."""
+        if not self.active:
+            return None
+        rem = self.dest - self.gun
+        move = clamp(self.speed * max(dt, 0.0), 0.0, abs(rem))
+        self.gun += math.copysign(move, rem) if rem else 0.0
+        self.hist.append((t_now, self.gun))
+        done = self.dest
+        if abs(done - self.gun) <= self.arrive:
+            self.gun = done
+            self.dest = None
+            return done
+        if t_now > self.deadline:
+            print("[sweep] swing overran its deadline, handing to the close-in loop", file=sys.stderr)
+            self.dest = None
+            return done
+        return None
 
 
 def body_aim(box, frac):
@@ -694,6 +813,17 @@ def run(args):
     # sim (the Mac webcam); the aim law in drive() must match the mount, so derive it from the link.
     on_gun = (link is not None) and not args.fixed_camera
 
+    # one-motion sweep needs the camera-on-gun geometry: its math treats each measurement as an
+    # offset from where the GUN pointed, which is wrong for a fixed camera / no-serial sim.
+    sweep_on = args.sweep and on_gun
+    sweep = SweepController(args.cam_lag) if sweep_on else None
+    if args.sweep and not sweep_on:
+        print("[turret] --sweep needs the real gun over serial (camera-on-gun); running without it",
+              file=sys.stderr)
+    elif sweep_on:
+        print(f"[turret] sweep ON -> far targets get ONE continuous full-speed swing, then the "
+              f"untouched close-in settle (cam lag {args.cam_lag:.2f}s)", file=sys.stderr)
+
     person_det = None
     if args.body_fusion:
         try:
@@ -722,7 +852,10 @@ def run(args):
         print(f"[turret] recognition ON -> targeting {tgt}", file=sys.stderr)
 
     pan, tilt = float(PAN_CENTER), float(TILT_CENTER)
-    pid_p = PID(args.kp, 0.0, 0.0, slew=args.max_step, sprint=args.sprint)  # pan sprints when far
+    # sweep owns far targets when on (sprint 0); sprint only ever alters output above 20 deg of
+    # error (slew/kp), so the close-in feel is identical either way.
+    pid_p = PID(args.kp, 0.0, 0.0, slew=args.max_step,
+                sprint=0.0 if sweep_on else args.sprint)  # pan sprints when far (flag-off mode)
     pid_t = PID(args.kp, 0.0, 0.0, slew=args.max_step)                      # tilt stays gentle (loose joint)
     armed = False
     lock_count = 0
@@ -762,6 +895,26 @@ def run(args):
         t_prev = now
         fps = 0.9 * fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
 
+        # sweep bookkeeping: advance the modeled gun while a swing is in flight (or record where
+        # it points now), and on the frame a swing ends run the SAME wipe a full target loss runs,
+        # so leftover blind-walk state can never march the gun off the spot it just arrived on.
+        sweeping = sweep is not None and sweep.active
+        if sweep is not None:
+            if sweeping:
+                hand = sweep.step(now, dt)
+                if hand is not None:
+                    sweeping = False
+                    vel_x = vel_y = 0.0
+                    vlast = None
+                    coast_rem = [0.0, 0.0]
+                    dist_ema = None
+                    dist_rate = 0.0
+                    pid_p.reset()
+                    pid_t.reset()
+                    last_tgt_angle = (hand, tilt)   # smart search hunts the ARRIVAL end of the swing
+            else:
+                sweep.sync(now, pan)
+
         boxes = det.detect(frame)
         rows = getattr(det, "last_faces", None)
         dets = [{"box": b, "row": (rows[i] if rows is not None and i < len(rows) else None),
@@ -784,7 +937,8 @@ def run(args):
                 target = (target[0], target[1], target[2], target[3],
                           int(round(ea[0])), int(round(ea[1])))
                 iod_px = ea[2]
-        elif person_det is not None and len(boxes) == 0 and (id_mode is None or latched):
+        elif person_det is not None and len(boxes) == 0 and (id_mode is None or latched) \
+                and not sweeping:   # mid-swing frames are smeared; a blurred shelf must not steer
             # FACE genuinely hidden (no face in view, not a DIFFERENT face): hold the lock on the body.
             # YOLO runs only here, so its cost is paid only while the face is gone.
             persons = person_det.detect(frame)
@@ -798,7 +952,7 @@ def run(args):
         fire = False
         patrolling = False
         dist = None
-        cor_tilt = 0.0
+        cor_pan = cor_tilt = 0.0
         fx = float(K[0][0]) if K is not None else focal_px(w)
         if target:
             tx, ty = target[4], target[5]
@@ -848,30 +1002,49 @@ def run(args):
                                                    elev_deg=tilt - TILT_CENTER)
                 tgt_pan = clamp(tgt_pan + cor_pan, SERVO_MIN, SERVO_MAX)
                 tgt_tilt = clamp(tgt_tilt + cor_tilt, SERVO_MIN, SERVO_MAX)
-            pan0, tilt0 = pan, tilt
-            pan, epan = drive(pid_p, pan, tgt_pan, dt, on_gun, PAN_CENTER, args.deadzone)
-            tilt, etilt = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone)
-            # travel still owed after this step: if detection blinks next frame, coast FINISHES
-            # this walk to the last-seen spot instead of freezing mid-stride.
-            coast_rem = [epan - (pan - pan0), etilt - (tilt - tilt0)]
-            # normal lock = target centered on the bore. ALSO count it locked when the gun is craned fully UP
-            # against its tilt cap and the target sits just above it: a LOW camera can't tilt up enough to
-            # center your face, but the bore is then resting on your CHEST = a valid body shot. This is why it
-            # tracked you but never fired (tilt pinned at 85, face above reach, so it never "locked"). Pan must
-            # still be centered on you. The real cure is raising the camera so tilt stops saturating.
-            tilt_maxed_on_body = TILT_LIMIT_MAX <= tgt_tilt <= TILT_LIMIT_MAX + 30
-            locked = abs(epan) < LOCK_TOL_DEG and (abs(etilt) < LOCK_TOL_DEG or tilt_maxed_on_body)
-            last_tgt_angle = (pan, tilt)        # remember where we were aimed -> smart search on loss
-            lock_count = lock_count + 1 if locked else 0
-            if armed and lock_count >= FIRE_HOLD_FRAMES and now - last_fire > FIRE_COOLDOWN_S:
-                fire = True
-                last_fire = now
+            if sweep is not None:
+                # sweep decisions use the NO-LEAD aim pixel: during a fast swing the walking-speed
+                # guess reads the room flying past and would bend the throw ~10 deg. measure() is
+                # a no-op while a swing is in flight (finish, fresh look, second swing if needed).
+                raw_pan = clamp(aim_to_angle(tx, ty, w, h)[0] + args.aim_pan + cor_pan,
+                                SERVO_MIN, SERVO_MAX)
+                sweep.measure(now, raw_pan - PAN_CENTER)
+            if sweep is not None and sweep.active:
+                # ONE-MOTION SWEEP: the destination was computed once, capture-time paired, and
+                # the firmware glide runs the whole move; the brain stops steering per-frame.
+                # Only tilt keeps its gentle law. The settle/lock/fire lines below are reached
+                # ONLY with no swing in flight, so that zone stays exactly today's code.
+                pan = sweep.dest
+                tilt, _ = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone)
+                locked = False
                 lock_count = 0
+            else:
+                pan0, tilt0 = pan, tilt
+                pan, epan = drive(pid_p, pan, tgt_pan, dt, on_gun, PAN_CENTER, args.deadzone)
+                tilt, etilt = drive(pid_t, tilt, tgt_tilt, dt, on_gun, TILT_CENTER, args.deadzone)
+                # travel still owed after this step: if detection blinks next frame, coast FINISHES
+                # this walk to the last-seen spot instead of freezing mid-stride.
+                coast_rem = [epan - (pan - pan0), etilt - (tilt - tilt0)]
+                # normal lock = target centered on the bore. ALSO count it locked when the gun is craned fully UP
+                # against its tilt cap and the target sits just above it: a LOW camera can't tilt up enough to
+                # center your face, but the bore is then resting on your CHEST = a valid body shot. This is why it
+                # tracked you but never fired (tilt pinned at 85, face above reach, so it never "locked"). Pan must
+                # still be centered on you. The real cure is raising the camera so tilt stops saturating.
+                tilt_maxed_on_body = TILT_LIMIT_MAX <= tgt_tilt <= TILT_LIMIT_MAX + 30
+                locked = abs(epan) < LOCK_TOL_DEG and (abs(etilt) < LOCK_TOL_DEG or tilt_maxed_on_body)
+                last_tgt_angle = (pan, tilt)        # remember where we were aimed -> smart search on loss
+                lock_count = lock_count + 1 if locked else 0
+                if armed and lock_count >= FIRE_HOLD_FRAMES and now - last_fire > FIRE_COOLDOWN_S:
+                    fire = True
+                    last_fire = now
+                    lock_count = 0
         else:
             locked = False
             lock_count = 0
             gap = now - last_seen
-            if gap < args.coast and vlast is not None:
+            if sweeping:
+                pan = sweep.dest   # blind mid-swing frame: the swing already knows where it is going
+            elif gap < args.coast and vlast is not None:
                 # brief dropout (blur/turn): do NOT extrapolate with velocity. On a LOST target the
                 # velocity is stale, so `vlast + vel*gap` flung the gun to a rail (pan 170 / tilt 60)
                 # every time detection blinked, which IS the wild "nodding" swing seen in the test clip.
@@ -929,7 +1102,10 @@ def run(args):
             bore_px = (angle_to_pixel(PAN_CENTER + args.aim_pan, TILT_CENTER + args.aim_tilt, w, h)
                        if on_gun else angle_to_pixel(pan, tilt, w, h))
             # live STATE readout, so the nod (if any) is visible: which mode each frame is in.
-            if target:
+            if sweep is not None and sweep.active:
+                extra = (f"SWEEP -> {sweep.dest:.0f} (gun ~{sweep.gun:.0f}"
+                         + ("" if target else ", blind") + ")")
+            elif target:
                 extra = "TRACK (body)" if target_is_body else "TRACK"
             elif patrolling:
                 extra = f"PATROL {args.patrol_tilt:.0f} (scanning L-R)"
@@ -1104,6 +1280,172 @@ def selftest():
     check("the OLD fixed law on camera-on-gun settles HALFWAY (the bug this fixes)",
           abs(_sim(False, False, 130.0) - (90.0 + 130.0) / 2) < 0.5)
 
+    # --- one-motion sweep (--sweep): capture-time pairing kills the stale-picture overshoot ---
+    sc = SweepController(0.10)
+    sc.sync(0.0, 90.0)
+    sc.sync(1.0, 100.0)
+    check("sweep history: exact sample lookup", sc.pos_at(1.0) == 100.0)
+    check("sweep history: interpolates between samples", abs(sc.pos_at(0.5) - 95.0) < 1e-9)
+    check("sweep history: clamps before the oldest sample", sc.pos_at(-5.0) == 90.0)
+    check("sweep history: clamps past the newest sample", sc.pos_at(9.0) == 100.0)
+
+    # the invariant that kills the overshoot: frames of ANY staleness name the SAME spot,
+    # because each offset pairs with where the gun pointed when THAT frame was captured
+    dests = []
+    for lag in (0.0, 0.05, 0.2, 0.5):
+        sc = SweepController(lag)
+        for i in range(61):                        # gun mid-sweep, 90 -> 150 over 0.6 s
+            sc.sync(i * 0.01, 90.0 + i)
+        off = 160.0 - sc.pos_at(0.60 - lag)        # what a frame captured `lag` ago actually saw
+        dests.append(sc.target_from(0.60, off))
+    check("sweep pairing: any-staleness frames all name the same true spot",
+          all(abs(d - 160.0) < 1e-6 for d in dests))
+
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    check("sweep entry: one far look never launches", sc.measure(0.0, 40.0) is False and not sc.active)
+    check("sweep entry: a second same-side look launches at the paired spot",
+          sc.measure(0.07, 40.0) is True and sc.active and abs(sc.dest - 130.0) < 1e-6)
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    sc.measure(0.0, 40.0)
+    check("sweep entry: opposite-side looks never pair up",
+          sc.measure(0.07, -40.0) is False and not sc.active)
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    sc.measure(0.0, 40.0)
+    sc.measure(0.07, 4.0)
+    check("sweep entry: a close look resets the streak", sc.measure(0.14, 40.0) is False)
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    sc.measure(0.0, 40.0)
+    check("sweep entry: a sighting from long ago never pairs with a new one",
+          sc.measure(2.0, 40.0) is False and not sc.active)
+
+    sc = SweepController(0.0)
+    sc.sync(0.0, 168.0)
+    a = sc.measure(0.0, 17.0)
+    b = sc.measure(0.07, 17.0)
+    check("sweep rail: a target past the cap never launches (no mode flicker)",
+          a is False and b is False and not sc.active)
+
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    sc.measure(0.0, 40.0)
+    sc.measure(0.07, 40.0)                         # launched: destination 130
+    t, done, path = 0.07, None, []
+    while done is None and t < 2.0:
+        t += 1 / 15
+        done = sc.step(t, 1 / 15)
+        path.append(sc.gun)
+    check("sweep model never passes its destination (arrive-never-pass)",
+          max(path) <= 130.0 + 1e-9)
+    check("sweep arrives, lands ON the spot, and hands off",
+          done == 130.0 and sc.gun == 130.0 and not sc.active)
+    check("sweep covers the move at full speed (about distance/133 s)",
+          abs((t - 0.07) - 40.0 / FW_PAN_DPS) < 0.15)
+
+    sc = SweepController(0.0)
+    sc.sync(0.0, 90.0)
+    sc.measure(0.0, 40.0)
+    sc.measure(0.07, 40.0)
+    sc.speed = 1.0                                 # cripple the model mid-flight
+    t, done = 0.07, None
+    while done is None and t < 5.0:
+        t += 1 / 15
+        done = sc.step(t, 1 / 15)
+    check("sweep hard timeout always hands control back", done is not None and t < 1.5)
+
+    sc = SweepController(0.10)
+    sc.sync(0.00, 90.0)
+    sc.measure(0.00, 40.0)
+    sc.sync(0.07, 90.0)
+    sc.measure(0.07, 40.0)                         # launched; the target really is at 130
+    t, done = 0.07, None
+    while done is None:
+        t += 1 / 15
+        done = sc.step(t, 1 / 15)
+    relaunched = False
+    for _ in range(5):                             # frames captured MID-swing keep arriving
+        t += 1 / 15
+        sc.sync(t, 130.0)
+        seen_gun = sc.pos_at(t - sc.cam_lag)       # the gun position that stale frame really saw
+        relaunched = relaunched or sc.measure(t, 130.0 - seen_gun)
+    check("sweep handoff hygiene: stale mid-swing frames never relaunch",
+          not relaunched and not sc.active)
+
+    # why the handoff wipe exists: a walking-speed guess computed ACROSS a swing is poison,
+    # the view jumped half a screen so the guess reads a sprint that is not happening
+    ppx = (1 - LEAD_SMOOTH) * 0.0 + LEAD_SMOOTH * ((800.0 - 200.0) / (1 / 15.0))
+    bend = math.degrees(math.atan((ppx * 0.12 / 640.0) * math.tan(math.radians(CAM_HFOV / 2.0))))
+    check("sweep handoff wipe: a cross-swing velocity guess would bend aim past lock",
+          bend > LOCK_TOL_DEG)
+
+    def _sweep_world(servo_dps, lag, target_world, seconds=6.0, fps=15.0, tail_pacing=False):
+        """Closed loop vs a firmware-like gun: camera lag live the WHOLE run, on-gun geometry
+        (each frame shows the target minus where the REAL gun pointed one lag ago), sweep + the
+        real settle law (kp .10 / step 2 / deadzone 3, sprint 0 as under --sweep). Returns
+        (best lock streak, overshoot past the target, final gun, launches)."""
+        dt = 1.0 / fps
+        sc = SweepController(lag)
+        pidx = PID(0.10, 0.0, 0.0, 2.0)
+        cmd = plant = 90.0
+        hist = [(0.0, plant)]
+
+        def plant_at(tq):
+            if tq <= hist[0][0]:
+                return hist[0][1]
+            if tq >= hist[-1][0]:
+                return hist[-1][1]
+            for (ta, pa), (tb, pb) in zip(hist, hist[1:]):
+                if ta <= tq <= tb:
+                    return pa + (pb - pa) * ((tq - ta) / (tb - ta) if tb > ta else 0.0)
+            return hist[-1][1]
+
+        t = 0.0
+        streak = best = launches = 0
+        peak = plant
+        for _ in range(int(seconds * fps)):
+            t += dt
+            rem = cmd - plant                          # the real gun glides toward the command
+            if tail_pacing and abs(rem) < 9.3:         # firmware re-paces the last stretch per resend
+                plant += 0.95 * rem
+            else:
+                plant += clamp(rem, -servo_dps * dt, servo_dps * dt)
+            hist.append((t, plant))
+            peak = max(peak, plant)
+            offset = target_world - plant_at(t - lag)  # what this (stale) frame shows
+            if sc.active:
+                if sc.step(t, dt) is not None:
+                    pidx.reset()                       # the handoff wipe (velocity state modeled clean)
+                if sc.active:
+                    cmd = sc.dest
+            else:
+                sc.sync(t, cmd)
+                if sc.measure(t, offset):
+                    launches += 1
+                    cmd = sc.dest
+                elif abs(offset) > 3.0:                # drive(): hold inside the deadzone
+                    cmd = clamp(cmd + pidx.step(offset, dt), 0.0, 180.0)
+            locked = (not sc.active) and abs(offset) < LOCK_TOL_DEG
+            streak = streak + 1 if locked else 0
+            best = max(best, streak)
+        return best, max(0.0, peak - target_world), plant, launches
+
+    best, over, endp, n = _sweep_world(133.0, 0.10, 150.0)
+    check("sweep sim: locks 5 straight frames with camera lag live the whole run",
+          best >= FIRE_HOLD_FRAMES)
+    check("sweep sim: no overshoot past ~2 deg", over <= 2.0)
+    check("sweep sim: ends parked on the target", abs(endp - 150.0) < LOCK_TOL_DEG)
+    check("sweep sim: one target = ONE swing (no re-sweep flicker)", n == 1)
+    best, over, _, n = _sweep_world(120.0, 0.10, 150.0)
+    check("sweep sim: a 10% slower real servo still locks", best >= FIRE_HOLD_FRAMES)
+    check("sweep sim: a slower servo still means one swing, no phantom re-sweep", n == 1)
+    check("sweep sim: a slower servo still does not overshoot", over <= 2.0)
+    best, _, _, n = _sweep_world(133.0, 0.10, 168.0, tail_pacing=True)
+    check("sweep sim: the firmware's re-paced final stretch still arrives and locks",
+          best >= FIRE_HOLD_FRAMES and n == 1)
+
     if os.path.exists(YUNET_PATH):
         try:
             YuNetFaceDetector(YUNET_PATH)
@@ -1174,6 +1516,16 @@ def main():
                          "side the step ramps up to this so it crosses the room fast, then hands back to "
                          "the untouched kp/max-step glide to settle. Close-in motion is bit-identical to "
                          "before (the smooth swing is preserved). 0 = off (pre-7/19 behavior)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="far targets: compute the destination ONCE and let the firmware glide run "
+                         "it as one continuous full-speed swing (no per-frame stepping), then hand "
+                         "off to the untouched close-in settle. Opt-in until field-proven; needs "
+                         "--serial (camera on the gun)")
+    ap.add_argument("--cam-lag", type=float, default=0.10,
+                    help="seconds the camera picture trails real life; the sweep pairs each frame "
+                         "with where the gun pointed back then. Swings land PAST you and walk back "
+                         "-> raise it (try 0.15); swings stop SHORT and crawl the rest -> lower it "
+                         "(try 0.05)")
     ap.add_argument("--lead", type=float, default=0.12,
                     help="seconds to lead a moving target (0 = aim where it is now)")
     ap.add_argument("--ballistic-lead", action="store_true",
