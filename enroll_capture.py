@@ -33,6 +33,19 @@ def main():
 
     det = YuNetFaceDetector(YUNET_PATH, args.det_score)
 
+    # identity guard: when this person already has a profile, auto-snap refuses frames that
+    # don't match it (same is-it-really-them rule the turret uses, margin veto included).
+    # This is what was missing on 6/28, when a capture session for one brother auto-saved
+    # the other brother's face into his folder and poisoned recognition for three weeks.
+    ident = None
+    try:
+        from face_id import FaceIdentifier
+        ident = FaceIdentifier(name=args.name, faces_dir=args.faces_dir, threshold=0.40, smooth=1.0)
+        print(f"[enroll] guard ON: auto-snap only saves faces that match the existing "
+              f"'{args.name}' profile (SPACE still force-saves)")
+    except Exception as e:
+        print(f"[enroll] no usable '{args.name}' profile yet ({e}); saving unguarded")
+
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         sys.exit(f"could not open camera {args.camera} (is the eMeet plugged in? run camera_probe.py)")
@@ -54,18 +67,31 @@ def main():
         has_face = bool(boxes)
         pose = poses[min((saved * len(poses)) // max(args.count, 1), len(poses) - 1)]
 
+        # a frame is auto-saveable only when there is exactly ONE face and (if a profile
+        # exists) it actually matches this person; anything else waits or needs SPACE.
+        auto_ok = has_face
+        tag = pose if has_face else "no face seen - face the camera"
+        if len(boxes) > 1:
+            auto_ok = False
+            tag = f"{len(boxes)} faces in view - only {args.name} please"
+        elif has_face and ident is not None:
+            idr = ident.classify(frame, boxes, getattr(det, "last_faces", None))[0]
+            if not idr["is_me"]:
+                auto_ok = False
+                tag = f"doesn't look like {args.name} ({idr['score']:.2f}) - not auto-saving"
+
         disp = frame.copy()
         for (x, y, bw, bh) in boxes:
-            cv2.rectangle(disp, (int(x), int(y)), (int(x + bw), int(y + bh)), (0, 255, 0), 2)
-        tag = pose if has_face else "no face seen - face the camera"
+            cv2.rectangle(disp, (int(x), int(y)), (int(x + bw), int(y + bh)),
+                          (0, 255, 0) if auto_ok else (0, 0, 255), 2)
         cv2.putText(disp, f"{tag}   {saved}/{args.count}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0) if has_face else (0, 0, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0) if auto_ok else (0, 0, 255), 2)
         cv2.imshow("enroll  (SPACE = snap, Q = quit)", disp)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        auto = has_face and (now - last) >= args.interval
+        auto = auto_ok and (now - last) >= args.interval
         if has_face and (key == ord(' ') or auto):
             fn = os.path.join(outdir, f"emeet_{existing + saved:03d}.jpg")
             cv2.imwrite(fn, frame)
