@@ -1511,11 +1511,11 @@ def main():
                     help="max degrees the aim command can move per frame. Lower = smoother, less "
                          "jerky; higher = faster but choppier. (2.0: reverted from 3.5 on 7/18, the faster "
                          "swing hurt smoothness and Ryan wanted the smooth motion back)")
-    ap.add_argument("--sprint", type=float, default=6.0,
-                    help="far-target speed cap, deg/frame (PAN only). When the target is way off to the "
-                         "side the step ramps up to this so it crosses the room fast, then hands back to "
-                         "the untouched kp/max-step glide to settle. Close-in motion is bit-identical to "
-                         "before (the smooth swing is preserved). 0 = off (pre-7/19 behavior)")
+    ap.add_argument("--sprint", type=float, default=0.0,
+                    help="far-target speed cap, deg/frame (PAN only), 0 = off. OFF is the default: the "
+                         "steady one-speed swing from the demo video won on feel (7/21) over both the "
+                         "fast dash and the sweep. Pass 6 to bring the dash back (it can slide past "
+                         "you and swing back once or twice before locking)")
     ap.add_argument("--sweep", action="store_true",
                     help="far targets: compute the destination ONCE and let the firmware glide run "
                          "it as one continuous full-speed swing (no per-frame stepping), then hand "
