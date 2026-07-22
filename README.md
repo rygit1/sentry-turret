@@ -12,7 +12,13 @@ I built the whole thing from scratch: the Python vision and aiming brain, the mi
 
 
 
-https://github.com/user-attachments/assets/dd90406e-9f9d-4b84-908a-b2d7f9ca70f9
+
+
+https://github.com/user-attachments/assets/a699cfc7-fd80-4cb7-8708-cb4928a87a86
+
+
+
+
 
 
 
